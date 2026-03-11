@@ -12947,5 +12947,23 @@ Buerklin-API Authentication server:
         <target>[Part_lot] created from barcode: Please check if the data is correct and desired.</target>
       </segment>
     </unit>
+    <unit id="xXJhxwB" name="settings.ips.lcsc.origin">
+      <segment>
+        <source>settings.ips.lcsc.origin</source>
+        <target>Data Source</target>
+      </segment>
+    </unit>
+    <unit id="0hyfw80" name="settings.ips.lcsc.origin_international">
+      <segment>
+        <source>settings.ips.lcsc.origin_international</source>
+        <target>International</target>
+      </segment>
+    </unit>
+    <unit id="mh7to.1" name="settings.ips.lcsc.origin_china">
+      <segment>
+        <source>settings.ips.lcsc.origin_china</source>
+        <target>China</target>
+      </segment>
+    </unit>
   </file>
 </xliff>

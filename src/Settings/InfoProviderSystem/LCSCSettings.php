@@ -28,9 +28,11 @@ use Jbtronics\SettingsBundle\Metadata\EnvVarMode;
 use Jbtronics\SettingsBundle\Settings\Settings;
 use Jbtronics\SettingsBundle\Settings\SettingsParameter;
 use Jbtronics\SettingsBundle\Settings\SettingsTrait;
+use Symfony\Component\Form\Extension\Core\Type\ChoiceType;
 use Symfony\Component\Form\Extension\Core\Type\CurrencyType;
 use Symfony\Component\Validator\Constraints as Assert;
 use Symfony\Component\Translation\TranslatableMessage as TM;
+use Symfony\Component\Validator\Constraints\Choice;
 
 #[Settings(label: new TM("settings.ips.lcsc"), description: new TM("settings.ips.lcsc.help"))]
 #[SettingsIcon("fa-plug")]
@@ -46,4 +48,17 @@ class LCSCSettings
         envVar: "string:PROVIDER_LCSC_CURRENCY", envVarMode: EnvVarMode::OVERWRITE)]
     #[Assert\Currency()]
     public string $currency = 'EUR';
+
+    #[SettingsParameter(
+        label: new TM("settings.ips.lcsc.origin"), formType: ChoiceType::class,
+        formOptions: [
+            'choices' => [
+                'settings.ips.lcsc.origin_international' => 'international',
+                'settings.ips.lcsc.origin_china' => 'china',
+            ],
+            'choice_translation_domain' => null,
+        ],
+        envVar: "string:PROVIDER_LCSC_ORIGIN", envVarMode: EnvVarMode::OVERWRITE)]
+    #[Assert\Choice(choices: ['international', 'china'])]
+    public string $origin = 'international';
 }

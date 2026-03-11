@@ -40,7 +40,7 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
 
     public const DISTRIBUTOR_NAME = 'LCSC';
 
-    public function __construct(private readonly HttpClientInterface $lcscClient, private readonly LCSCSettings $settings)
+    public function __construct(private readonly HttpClientInterface $lcscClient, private readonly LCSCSettings $settings,private readonly SZLCSCClient $szlcscClient)
     {
 
     }
@@ -72,7 +72,7 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
      * @param  bool  $lightweight If true, skip expensive operations like datasheet resolution
      * @return PartDetailDTO
      */
-    private function queryDetail(string $id, bool $lightweight = false): PartDetailDTO
+    private function queryDetailIntl(string $id, bool $lightweight = false): PartDetailDTO
     {
         $response = $this->lcscClient->request('GET', self::ENDPOINT_URL . "/product/detail", [
             'headers' => [
@@ -90,7 +90,7 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
             throw new \RuntimeException('Could not find product code: ' . $id);
         }
 
-        return $this->getPartDetail($product, $lightweight);
+        return $this->getPartDetailIntl($product, $lightweight);
     }
 
     /**
@@ -123,13 +123,13 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
      * @param  bool  $lightweight If true, skip expensive operations like datasheet resolution
      * @return PartDetailDTO[]
      */
-    private function queryByTerm(string $term, bool $lightweight = false): array
+    private function queryByTermIntl(string $term, bool $lightweight = false): array
     {
         // Optimize: If term looks like an LCSC part number (starts with C followed by digits),
         // use direct detail query instead of slower search
         if (preg_match('/^C\d+$/i', trim($term))) {
             try {
-                return [$this->queryDetail(trim($term), $lightweight)];
+                return [$this->queryDetailIntl(trim($term), $lightweight)];
             } catch (\Exception $e) {
                 // If direct lookup fails, fall back to search
                 // This handles cases where the C-code might not exist
@@ -158,11 +158,11 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
         // detailed product listing. It does so utilizing a product tip field.
         // If product tip exists and there are no products in the product list try a detail query
         if (count($products) === 0 && $tipProductCode !== null) {
-            $result[] = $this->queryDetail($tipProductCode, $lightweight);
+            $result[] = $this->queryDetailIntl($tipProductCode, $lightweight);
         }
 
         foreach ($products as $product) {
-            $result[] = $this->getPartDetail($product, $lightweight);
+            $result[] = $this->getPartDetailIntl($product, $lightweight);
         }
 
         return $result;
@@ -191,7 +191,7 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
      * @param  array  $product
      * @return PartDetailDTO
      */
-    private function getPartDetail(array $product, bool $lightweight = false): PartDetailDTO
+    private function getPartDetailIntl(array $product, bool $lightweight = false): PartDetailDTO
     {
         // Get product images in advance
         $product_images = $this->getProductImages($product['productImages'] ?? null);
@@ -214,8 +214,9 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
         if (isset($product['catalogName'])) {
             $category = ($category ?? '') . ' -> ' . $product['catalogName'];
         }
-
-        return new PartDetailDTO(
+        dump($product);
+        dump($product_images);
+        $a = new PartDetailDTO(
             provider_key: $this->getProviderKey(),
             provider_id: $product['productCode'],
             name: $product['productModel'],
@@ -233,6 +234,8 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
             vendor_infos: $lightweight ? [] : $this->pricesToVendorInfo($product['productCode'], $this->getProductShortURL($product['productCode']), $product['productPriceList'] ?? []),
             mass: $product['weight'] ?? null,
         );
+        dump($a);
+        return $a;
     }
 
     /**
@@ -361,6 +364,32 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
      */
     public function searchByKeywordsBatch(array $keywords): array
     {
+        if ($this->isChinaOrigin()) {
+            return $this->searchByKeywordsBatchChina($keywords);
+        }
+
+        return $this->searchByKeywordsBatchIntl($keywords);
+    }
+
+    private function searchByKeywordsBatchChina(array $keywords): array
+    {
+        $rawResults = $this->szlcscClient->getCProductInfoByKeywordsBatch($keywords);
+
+        $results = [];
+        foreach ($rawResults as $keyword => $products) {
+            $results[$keyword] = [];
+
+            foreach ($products as $product) {
+                $results[$keyword][] = $this->getPartDetailChina($product, true);
+            }
+        }
+
+        return $results;
+    }
+
+
+    public function searchByKeywordsBatchIntl(array $keywords): array
+    {
         if (empty($keywords)) {
             return [];
         }
@@ -430,16 +459,7 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
 
     public function getDetails(string $id): PartDetailDTO
     {
-        $tmp = $this->queryByTerm($id, false);
-        if (count($tmp) === 0) {
-            throw new \RuntimeException('No part found with ID ' . $id);
-        }
-
-        if (count($tmp) > 1) {
-            throw new \RuntimeException('Multiple parts found with ID ' . $id);
-        }
-
-        return $tmp[0];
+        return $this->queryDetail($id, false);
     }
 
     public function getCapabilities(): array
@@ -468,5 +488,151 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
             return $matches[1];
         }
         return null;
+    }
+
+    /**
+     * Checks if the provider is configured to use the China-origin API or the international one.
+     */
+    private function isChinaOrigin(): bool
+    {
+        return $this->settings->origin === 'china';
+    }
+
+    private function queryByTermChina(string $term, bool $lightweight = false): array
+    {
+        $products = $this->szlcscClient->getCProductInfoByKeyword($term);
+
+        $result = [];
+        foreach ($products as $product) {
+            $result[] = $this->getPartDetailChina($product, $lightweight);
+        }
+
+        return $result;
+    }
+
+    private function queryDetailChina(string $cCode, bool $lightweight = false): PartDetailDTO
+    {
+        $product = $this->szlcscClient->getProductInfoByCCode(trim($cCode));
+
+        if ($product === null) {
+            throw new \RuntimeException('Could not find SZLCSC product code: ' . $cCode);
+        }
+
+        return $this->getPartDetailChina($product, $lightweight);
+    }
+
+    /**
+     * Unified detail entrypoint.
+     */
+    private function queryDetail(string $id, bool $lightweight = false): PartDetailDTO
+    {
+        if ($this->isChinaOrigin()) {
+            return $this->queryDetailChina($id, $lightweight);
+        }
+
+        return $this->queryDetailIntl($id, $lightweight);
+    }
+
+    private function getChinaDetailImages(array $detail): array
+    {
+        $image = $detail['image'] ?? null;
+
+        if (!is_string($image) || trim($image) === '') {
+            return [];
+        }
+
+        $parts = explode('<$>', $image);
+
+        return array_values(array_filter(
+            array_map(static fn(string $item) => trim($item), $parts),
+            static fn(string $item) => $item !== ''
+        ));
+    }
+
+    private function getChinaDetailImageFiles(array $detail): array
+    {
+        $images = $this->getChinaDetailImages($detail);
+
+        return array_map(
+            static fn(string $url) => new FileDTO($url, null),
+            $images
+        );
+    }
+
+    /**
+     * Unified search entrypoint.
+     *
+     * @return PartDetailDTO[]
+     */
+    private function queryByTerm(string $term, bool $lightweight = false): array
+    {
+        if ($this->isChinaOrigin()) {
+            return $this->queryByTermChina($term, $lightweight);
+        }
+
+        return $this->queryByTermIntl($term, $lightweight);
+    }
+
+    private function getPartDetailChina(array $product, bool $lightweight = false): PartDetailDTO
+    {
+        $basic = $product['basic'] ?? [];
+        $detail = $product['detail'] ?? [];
+
+        dump($basic);
+        dump($detail);
+
+        $images = $this->getChinaDetailImageFiles($detail);
+
+        $previewImage = $images !== [] ? $images[0]->url : null;
+
+        if (($previewImage === null || trim((string) $previewImage) === '') && isset($basic['image']) && is_string($basic['image'])) {
+            $previewImage = $basic['image'];
+        }
+
+        $parameters = [];
+        if (!$lightweight) {
+            foreach (($detail['param'] ?? []) as $name => $value) {
+                if ($value === null || trim((string) $value) === '') {
+                    continue;
+                }
+
+                $parameters[] = ParameterDTO::parseValueIncludingUnit(
+                    name: (string) $name,
+                    value: (string) $value,
+                    group: null,
+                );
+            }
+        }
+        dump($images);
+        return new PartDetailDTO(
+            provider_key: $this->getProviderKey(),
+            provider_id: (string) ($basic['code'] ?? ''),
+            name: (string) ($basic['model'] ?? ''),
+            description: $this->sanitizeField($detail['name'] ?? $basic['name'] ?? null),
+            category: $this->sanitizeField($basic['catalogName'] ?? null),
+            manufacturer: $this->sanitizeField($basic['brandName'] ?? null),
+            mpn: $this->sanitizeField($basic['model'] ?? null),
+            preview_image_url: $previewImage,
+            manufacturing_status: null,
+            provider_url: $basic['detail_url'] ?? null,
+            footprint: $this->sanitizeField($basic['standard'] ?? null),
+            datasheets: [], // TODO: wire to SZLCSC annex/file list API
+            images: $images,
+            parameters: $parameters,
+            vendor_infos: [], // TODO: optional price/stock workaround later
+            mass: $basic['productWeight'] * 1000 ?? null, // Convert kg to g
+        );
+    }
+
+    /**
+     * Unified raw-product mapping entrypoint.
+     */
+    private function getPartDetail(array $product, bool $lightweight = false): PartDetailDTO
+    {
+        if ($this->isChinaOrigin()) {
+            return $this->getPartDetailChina($product, $lightweight);
+        }
+
+        return $this->getPartDetailIntl($product, $lightweight);
     }
 }
