@@ -30,6 +30,7 @@ use App\Services\InfoProviderSystem\DTOs\PriceDTO;
 use App\Services\InfoProviderSystem\DTOs\PurchaseInfoDTO;
 use App\Services\InfoProviderSystem\Providers\LCSCProvider;
 use App\Services\InfoProviderSystem\Providers\ProviderCapabilities;
+use App\Services\InfoProviderSystem\Providers\SZLCSCClient;
 use App\Settings\InfoProviderSystem\LCSCSettings;
 use App\Tests\SettingsTestHelper;
 use PHPUnit\Framework\TestCase;
@@ -42,6 +43,7 @@ final class LCSCProviderTest extends TestCase
     private LCSCSettings $settings;
     private LCSCProvider $provider;
     private MockHttpClient $httpClient;
+    private SZLCSCClient $szlcscClient;
 
     protected function setUp(): void
     {
@@ -49,7 +51,8 @@ final class LCSCProviderTest extends TestCase
         $this->settings = SettingsTestHelper::createSettingsDummy(LCSCSettings::class);
         $this->settings->currency = 'USD';
         $this->settings->enabled = true;
-        $this->provider = new LCSCProvider($this->httpClient, $this->settings);
+        $this->szlcscClient = new SZLCSCClient(new MockHttpClient());
+        $this->provider = new LCSCProvider($this->httpClient, $this->settings, $this->szlcscClient);
     }
 
     public function testGetProviderInfo(): void

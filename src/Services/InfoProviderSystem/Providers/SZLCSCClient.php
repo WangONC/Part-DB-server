@@ -30,6 +30,7 @@ class SZLCSCClient
     private const SEARCH_HOST = 'https://so.szlcsc.com';
     private const ITEM_HOST = 'https://item.szlcsc.com';
     private const LIST_HOST = 'https://list.szlcsc.com';
+    private ?array $catalogPathMap = null;
 
     // iPhone 12 / iOS 18.1.1
     private const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Html5Plus/1.0 (Immersed/20) uni-app';
@@ -75,6 +76,11 @@ class SZLCSCClient
         }
 
         return $data['result'] ?? [];
+    }
+
+    public function getBrandCatalogData(): array
+    {
+        return $this->requestJson('GET', self::SEARCH_HOST . '/phone/p/catalog/brand/list');
     }
 
     public function searchProducts(
@@ -135,60 +141,31 @@ class SZLCSCClient
         return null;
     }
 
-    public function getProductInfoByCCode(string $cCode): ?array
+    public function getProductInfoByCCode(string $cCode, bool $withPrice = true, bool $withDetail = true): ?array
     {
         $cCode = trim($cCode);
         if ($cCode === '') {
             return null;
         }
 
-        $search = $this->searchProducts($cCode, 1, 10);
-        $searchProducts = $search['productList'] ?? [];
+        $products = $this->getProductInfoByKeyword($cCode, $withPrice, $withDetail);
 
-        if (!is_array($searchProducts) || $searchProducts === []) {
-            return null;
-        }
+        foreach ($products as $product) {
+            if (!is_array($product)) {
+                continue;
+            }
 
-        $exactMatch = $this->findExactProductByCode($searchProducts, $cCode);
-        if ($exactMatch === null) {
-            return null;
-        }
-
-        // basic 优先尝试用分类商品列表结果覆盖，因为它通常更完整
-        $basic = $exactMatch;
-
-        $catalogId = $exactMatch['catalogId'] ?? null;
-        if ($catalogId !== null && $catalogId !== '') {
-            try {
-                $catalogResult = $this->getProductList((int) $catalogId, $cCode, 1, 10);
-                $catalogProducts = $catalogResult['productList'] ?? [];
-
-                if (is_array($catalogProducts)) {
-                    $catalogMatch = $this->findExactProductByCode($catalogProducts, $cCode);
-                    if ($catalogMatch !== null) {
-                        $basic = $catalogMatch;
-                    }
-                }
-            } catch (\Throwable) {
-                // 分类列表失败时，退回搜索结果
+            $basic = $product['basic'] ?? null;
+            if (is_array($basic) && ($basic['code'] ?? null) === $cCode) {
+                return $product;
             }
         }
 
-        // detail 仍然依赖 productSignId
-        $productSignId = $basic['productSignId'] ?? $exactMatch['productSignId'] ?? null;
-        $detail = [];
-
-        if (is_string($productSignId) && trim($productSignId) !== '') {
-            $detail = $this->getProductDetail($productSignId);
-        }
-
-        return [
-            'basic' => $basic,
-            'detail' => $detail,
-        ];
+        return null;
     }
 
-    public function getCProductInfoByKeyword(string $keyword): array
+
+    public function getProductInfoByKeyword(string $keyword, bool $withPrice = false, bool $withDetail = false): array
     {
         $keyword = trim($keyword);
         if ($keyword === '') {
@@ -202,9 +179,40 @@ class SZLCSCClient
             return [];
         }
 
+        $products = $productList;
+
+        if ($withPrice) {
+            $products = array_map(function ($product) use ($keyword) {
+                if (!is_array($product)) {
+                    return $product;
+                }
+
+                $catalogId = $product['catalogId'] ?? null;
+                if ($catalogId === null || $catalogId === '') {
+                    return $product;
+                }
+
+                try {
+                    $catalogResult = $this->getProductList((int) $catalogId, $keyword, 1, 10);
+                    $catalogProducts = $catalogResult['productList'] ?? [];
+
+                    if (is_array($catalogProducts)) {
+                        $catalogMatch = $this->findExactProductByCode($catalogProducts, $product['code'] ?? '');
+                        if ($catalogMatch !== null) {
+                            return $catalogMatch;
+                        }
+                    }
+                } catch (\Throwable) {
+                    // 分类列表失败时，退回原始 basic
+                }
+
+                return $product;
+            }, $products);
+        }
+
         $results = [];
 
-        foreach ($productList as $product) {
+        foreach ($products as $product) {
             if (!is_array($product)) {
                 continue;
             }
@@ -212,7 +220,7 @@ class SZLCSCClient
             $detail = [];
             $productSignId = $product['productSignId'] ?? null;
 
-            if (is_string($productSignId) && trim($productSignId) !== '') {
+            if ($withDetail && is_string($productSignId) && trim($productSignId) !== '') {
                 try {
                     $detail = $this->getProductDetail($productSignId);
                 } catch (\Throwable) {
@@ -245,7 +253,7 @@ class SZLCSCClient
         ), static fn(string $item) => $item !== ''));
     }
 
-    public function getCProductInfoByKeywordsBatch(array $keywords): array
+    public function getProductInfoByKeywordsBatch(array $keywords): array
     {
         if (empty($keywords)) {
             return [];
@@ -346,5 +354,152 @@ class SZLCSCClient
         }
 
         return $results;
+    }
+
+    public function getCatalogPathById(int $catalogId): ?string
+    {
+        if ($this->catalogPathMap === null) {
+            $this->catalogPathMap = [];
+
+            $data = $this->getBrandCatalogData();
+            $catalogList = $data['catalogList'] ?? [];
+
+            $buildMap = function (array $nodes, ?string $parentName = null) use (&$buildMap): void {
+                foreach ($nodes as $node) {
+                    if (!is_array($node)) {
+                        continue;
+                    }
+
+                    $id = isset($node['catalogId']) ? (int) $node['catalogId'] : null;
+                    $name = isset($node['catalogName']) ? trim((string) $node['catalogName']) : '';
+
+                    if ($id !== null && $name !== '') {
+                        $this->catalogPathMap[$id] = $parentName !== null && $parentName !== ''
+                            ? $parentName . ' -> ' . $name
+                            : $name;
+                    }
+
+                    $sons = $node['sonList'] ?? [];
+                    if (is_array($sons) && $sons !== []) {
+                        $buildMap($sons, $name !== '' ? $name : $parentName);
+                    }
+                }
+            };
+
+            if (is_array($catalogList)) {
+                $buildMap($catalogList);
+            }
+        }
+
+        return $this->catalogPathMap[$catalogId] ?? null;
+    }
+
+    public function getProductPdfAndPdb(string $cCode, string $annexNumber): array
+    {
+        return $this->requestJson('GET', self::SEARCH_HOST . '/product/showProductPDFAndPCB', [
+            'headers' => [
+                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0',
+                'Referer' => 'https://www.szlcsc.com/',
+                'Origin' => 'https://www.szlcsc.com',
+                'X-Lc-Source' => 'Web',
+            ],
+            'query' => [
+                'productCode' => $cCode,
+                'annexNumber' => $annexNumber,
+            ],
+        ]);
+    }
+
+    public function getProductAnnexList(string $cCode, string $annexNumber): array
+    {
+        $result = $this->getProductPdfAndPdb($cCode, $annexNumber);
+
+        $annexes = [];
+        $baseDomain = 'https://atta.szlcsc.com/';
+
+        $fileTypeVOList = $result['fileTypeVOList'] ?? [];
+        if (is_array($fileTypeVOList)) {
+            foreach ($fileTypeVOList as $group) {
+                if (!is_array($group)) {
+                    continue;
+                }
+
+                $type = isset($group['fileType']) && is_string($group['fileType'])
+                    ? $group['fileType']
+                    : null;
+
+                $detailVOList = $group['detailVOList'] ?? [];
+                if (!is_array($detailVOList)) {
+                    continue;
+                }
+
+                foreach ($detailVOList as $detail) {
+                    if (!is_array($detail)) {
+                        continue;
+                    }
+
+                    $url = null;
+
+                    if (!empty($detail['linkAddress']) && is_string($detail['linkAddress'])) {
+                        $url = $detail['linkAddress'];
+                    } elseif (!empty($detail['fileUrl']) && is_string($detail['fileUrl'])) {
+                        $url = $baseDomain . ltrim($detail['fileUrl'], '/') . (string) ($detail['urlSign'] ?? '');
+                    }
+
+                    if ($url !== null) {
+                        $annexes[] = [
+                            'url' => $url,
+                            'name' => isset($detail['fileName']) && is_string($detail['fileName'])
+                                ? $detail['fileName']
+                                : null,
+                            'type' => $type,
+                        ];
+                    }
+                }
+            }
+        }
+
+        $fileList = $result['fileList'] ?? [];
+        if (is_array($fileList)) {
+            foreach ($fileList as $file) {
+                if (!is_array($file)) {
+                    continue;
+                }
+
+                if (!empty($file['annexUrl']) && is_string($file['annexUrl'])) {
+                    $url = $baseDomain . ltrim($file['annexUrl'], '/') . (string) ($file['urlSign'] ?? '');
+
+                    $annexes[] = [
+                        'url' => $url,
+                        'name' => isset($file['annexRealName']) && is_string($file['annexRealName'])
+                            ? $file['annexRealName']
+                            : null,
+                        'type' => null,
+                    ];
+                }
+            }
+        }
+
+        $pdfLink = $result['pdfLink'] ?? null;
+        if (is_string($pdfLink) && trim($pdfLink) !== '') {
+            $exists = false;
+            foreach ($annexes as $annex) {
+                if (($annex['url'] ?? null) === $pdfLink) {
+                    $exists = true;
+                    break;
+                }
+            }
+
+            if (!$exists) {
+                array_unshift($annexes, [
+                    'url' => $pdfLink,
+                    'name' => isset($result['productCode']) && is_string($result['productCode'])
+                        ? $result['productCode']
+                        : null,
+                    'type' => null,
+                ]);
+            }
+        }
+        return $annexes;
     }
 }

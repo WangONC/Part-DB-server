@@ -40,10 +40,7 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
 
     public const DISTRIBUTOR_NAME = 'LCSC';
 
-    public function __construct(private readonly HttpClientInterface $lcscClient, private readonly LCSCSettings $settings,private readonly SZLCSCClient $szlcscClient)
-    {
-
-    }
+    public function __construct(private readonly HttpClientInterface $lcscClient, private readonly LCSCSettings $settings, private readonly SZLCSCClient $szlcscClient) {}
 
     public function getProviderInfo(): array
     {
@@ -214,8 +211,6 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
         if (isset($product['catalogName'])) {
             $category = ($category ?? '') . ' -> ' . $product['catalogName'];
         }
-        dump($product);
-        dump($product_images);
         $a = new PartDetailDTO(
             provider_key: $this->getProviderKey(),
             provider_id: $product['productCode'],
@@ -234,7 +229,6 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
             vendor_infos: $lightweight ? [] : $this->pricesToVendorInfo($product['productCode'], $this->getProductShortURL($product['productCode']), $product['productPriceList'] ?? []),
             mass: $product['weight'] ?? null,
         );
-        dump($a);
         return $a;
     }
 
@@ -373,7 +367,7 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
 
     private function searchByKeywordsBatchChina(array $keywords): array
     {
-        $rawResults = $this->szlcscClient->getCProductInfoByKeywordsBatch($keywords);
+        $rawResults = $this->szlcscClient->getProductInfoByKeywordsBatch($keywords);
 
         $results = [];
         foreach ($rawResults as $keyword => $products) {
@@ -500,10 +494,19 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
 
     private function queryByTermChina(string $term, bool $lightweight = false): array
     {
-        $products = $this->szlcscClient->getCProductInfoByKeyword($term);
+        $keyword = trim($term);
+        if ($keyword === '') {
+            return [];
+        }
+
+        $products = $this->szlcscClient->getProductInfoByKeyword($keyword);
 
         $result = [];
         foreach ($products as $product) {
+            if (!is_array($product)) {
+                continue;
+            }
+
             $result[] = $this->getPartDetailChina($product, $lightweight);
         }
 
@@ -518,6 +521,8 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
             throw new \RuntimeException('Could not find SZLCSC product code: ' . $cCode);
         }
 
+        // 在商品详情我们一般会希望看到大图，而不是小的预览图
+        $product["basic"]["image"] = "";
         return $this->getPartDetailChina($product, $lightweight);
     }
 
@@ -578,21 +583,18 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
         $basic = $product['basic'] ?? [];
         $detail = $product['detail'] ?? [];
 
-        dump($basic);
-        dump($detail);
-
         $images = $this->getChinaDetailImageFiles($detail);
 
-        $previewImage = $images !== [] ? $images[0]->url : null;
+        $previewImage = $basic['image'];
 
-        if (($previewImage === null || trim((string) $previewImage) === '') && isset($basic['image']) && is_string($basic['image'])) {
-            $previewImage = $basic['image'];
+        if (($previewImage === null || trim((string) $previewImage) === '') && isset($images[0]->url) && is_string($images[0]->url)) {
+            $previewImage = $images[0]->url;
         }
 
         $parameters = [];
         if (!$lightweight) {
             foreach (($detail['param'] ?? []) as $name => $value) {
-                if ($value === null || trim((string) $value) === '') {
+                if (in_array(trim((string) $value), ['', '-'], true)) {
                     continue;
                 }
 
@@ -603,23 +605,47 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
                 );
             }
         }
-        dump($images);
+
+        $categoryPath = null;
+        if (isset($basic['catalogId'])) {
+            $categoryPath = $this->szlcscClient->getCatalogPathById((int) $basic['catalogId']);
+        }
+
+        $price_dtos = [];
+        $prices = $basic["priceList"];
+        foreach ($prices as $price) {
+            $price_dtos[] = new PriceDTO(
+                minimum_discount_amount: $price['startNumber'],
+                price: (string)$price['price'],
+                currency_iso_code: "CNY", // 立创商城不支持其他货币
+                includes_tax: true,       // 立创商城都是默认含税价格
+            );
+        }
+        $vender_infos = [
+            new PurchaseInfoDTO(
+                distributor_name: "立创商城",
+                order_number: $basic["code"],
+                prices: $price_dtos,
+                product_url: "https://item.szlcsc.com/{$basic["id"]}.html",
+            )
+        ];
+
         return new PartDetailDTO(
             provider_key: $this->getProviderKey(),
             provider_id: (string) ($basic['code'] ?? ''),
             name: (string) ($basic['model'] ?? ''),
             description: $this->sanitizeField($detail['name'] ?? $basic['name'] ?? null),
-            category: $this->sanitizeField($basic['catalogName'] ?? null),
+            category: $this->sanitizeField($categoryPath ?? null),
             manufacturer: $this->sanitizeField($basic['brandName'] ?? null),
             mpn: $this->sanitizeField($basic['model'] ?? null),
             preview_image_url: $previewImage,
             manufacturing_status: null,
             provider_url: $basic['detail_url'] ?? null,
             footprint: $this->sanitizeField($basic['standard'] ?? null),
-            datasheets: [], // TODO: wire to SZLCSC annex/file list API
+            datasheets: $lightweight ? [] : $this->getChinaDatasheets($basic,$detail),
             images: $images,
             parameters: $parameters,
-            vendor_infos: [], // TODO: optional price/stock workaround later
+            vendor_infos: $lightweight ? [] : $vender_infos,
             mass: $basic['productWeight'] * 1000 ?? null, // Convert kg to g
         );
     }
@@ -634,5 +660,113 @@ class LCSCProvider implements BatchInfoProviderInterface, URLHandlerInfoProvider
         }
 
         return $this->getPartDetailIntl($product, $lightweight);
+    }
+
+    private function extractNextData(string $html): array
+    {
+        if (!preg_match('/<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/s', $html, $matches)) {
+            return [];
+        }
+
+        $json = $matches[1] ?? '';
+        if (!is_string($json) || trim($json) === '') {
+            return [];
+        }
+
+        $data = json_decode($json, true);
+
+        if (!is_array($data)) {
+            return [];
+        }
+
+        return $data['props']['pageProps'] ?? [];
+    }
+
+    private function getChinaDatasheets(array $basic, array $detail): array
+    {
+        $pdfUrl = $detail['pdfUrl'] ?? null;
+        $model = $detail['model'] ?? $basic['model'] ?? null;
+        $id = $detail['id'] ?? $basic['id'] ?? null;
+
+        // The original datasheet URL format was "https://atta.szlcsc.com/{$detail["pdfUrl"]}", but that link has cross-site access restrictions.
+        // When accessed directly from Part-DB, a Referer header is sent, so the URL cannot be opened properly.
+        // Therefore, a wrapped HTML datasheet link is used instead.
+        if (
+            is_string($pdfUrl) && trim($pdfUrl) !== ''
+            && is_string($model) && trim($model) !== ''
+            && $id !== null && (string) $id !== ''
+        ) {
+            return [
+                new FileDTO(
+                    'https://item.szlcsc.com/datasheet/' . rawurlencode((string) $model) . '/' . rawurlencode((string) $id) . '.html',
+                    null
+                )
+            ];
+        }
+
+        $cCode = $basic['code'] ?? null;
+        $productId = $detail['id'] ?? $basic['id'] ?? null;
+
+        if (!is_string($cCode) || trim($cCode) === '' || $productId === null || (string) $productId === '') {
+            return [];
+        }
+
+        try {
+            $detailUrl = 'https://item.szlcsc.com/' . $productId . '.html';
+            $response = $this->lcscClient->request('GET', $detailUrl, [
+                'headers' => [
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+                    'Referer' => 'https://www.szlcsc.com/',
+                ],
+            ]);
+
+            $pageProps = $this->extractNextData($response->getContent(false));
+            $annexNumber = $pageProps['webData']['productRecord']['pdfDESProductId'] ?? null;
+
+            if (!is_string($annexNumber) || trim($annexNumber) === '') {
+                return [];
+            }
+
+            $annexes = $this->szlcscClient->getProductAnnexList($cCode, $annexNumber);
+
+            $datasheets = [];
+            $seen = [];
+
+            foreach ($annexes as $annex) {
+                if (!is_array($annex)) {
+                    continue;
+                }
+
+                $type = $annex['type'] ?? '';
+                $url = $annex['url'] ?? null;
+                $name = $annex['name'] ?? null;
+
+                if (!is_string($url) || trim($url) === '') {
+                    continue;
+                }
+
+                if (!in_array($type, ['pdf_link', 'pdf_property'], true)) {
+                    continue;
+                }
+
+                $url = trim($url);
+                $key = $url;
+
+                if (isset($seen[$key])) {
+                    continue;
+                }
+                $seen[$key] = true;
+
+                $datasheets[] = new FileDTO(
+                    $url,
+                    is_string($name) && trim($name) !== '' ? $name : null
+                );
+            }
+
+            return $datasheets;
+        } catch (\Throwable) {
+        }
+
+        return [];
     }
 }
